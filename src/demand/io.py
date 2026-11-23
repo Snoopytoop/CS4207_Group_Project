@@ -44,6 +44,19 @@ def schema_differences(files: list[Path]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def footer_null_counts(path: Path) -> pd.Series:
+    """Null count of EVERY column, from the row-group statistics in the footer (no data read)."""
+    md = pq.ParquetFile(path).metadata
+    counts = {}
+    for rg in range(md.num_row_groups):
+        for c in range(md.num_columns):
+            col = md.row_group(rg).column(c)
+            stats = col.statistics
+            n = stats.null_count if stats is not None and stats.has_null_count else 0
+            counts[col.path_in_schema] = counts.get(col.path_in_schema, 0) + n
+    return pd.Series(counts, name="nulls")
+
+
 def read_month(path: Path, columns: list[str] | None = None) -> pd.DataFrame:
     """Read one month with column pruning (only `columns` are decoded)."""
     columns = columns or config.READ_COLUMNS

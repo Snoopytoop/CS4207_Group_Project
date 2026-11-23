@@ -1,0 +1,10 @@
+source,version,run,series_hash,first_hour,fare_sq_hex,fare_sq_total,order_head,fare_sq_fsum_hex,rmse,learning_rate,max_leaf_nodes
+completion+reduction order,broken,1,f44027a1b343,2024-07-01 00:00:00,0x1.102daf7dc7c3ap+40,1168997580231.7642,"2024-07,2024-08,2024-02,2024-06",,,,
+completion+reduction order,broken,2,b646548b967e,2024-07-01 00:00:00,0x1.102daf7dc7c61p+40,1168997580231.7737,"2024-07,2024-08,2024-01,2024-02",,,,
+completion+reduction order,broken,3,9c7701d57691,2024-08-01 00:00:00,0x1.102daf7dc7c3ep+40,1168997580231.7651,"2024-08,2024-07,2024-01,2024-02",,,,
+completion+reduction order,fixed,1,19657da16f9c,2024-01-01 00:00:00,0x1.102daf7dc7c65p+40,1168997580231.7747,"2024-01,2024-02,2024-03,2024-04",0x1.102daf7dc7c80p+40,,,
+completion+reduction order,fixed,2,19657da16f9c,2024-01-01 00:00:00,0x1.102daf7dc7c65p+40,1168997580231.7747,"2024-01,2024-02,2024-03,2024-04",0x1.102daf7dc7c80p+40,,,
+unseeded randomness,broken,1,,,,,,,442.76987243150256,0.07463094226534527,59.0
+unseeded randomness,broken,2,,,,,,,440.67821806482397,0.09717018816765499,17.0
+unseeded randomness,fixed,1,,,,,,,440.8808634119707,0.08064518411923295,19.0
+unseeded randomness,fixed,2,,,,,,,440.8808634119707,0.08064518411923295,19.0

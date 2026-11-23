@@ -136,7 +136,9 @@ display(pd.DataFrame({
     "min": [apr["tpep_pickup_datetime"].min(), dur_min.min(), apr["trip_distance"].min(), apr["fare_amount"].min()],
     "max": [apr["tpep_pickup_datetime"].max(), dur_min.max(), apr["trip_distance"].max(), apr["fare_amount"].max()],
 }, index=["pickup time", "duration (min)", "distance (miles)", "fare ($)"]))
-print("Null counts:"); print(apr.isna().sum()[lambda s: s > 0].to_string())
+nulls = io.footer_null_counts(config.DATA_DIR / f"yellow_tripdata_{MONTH}.parquet")
+print("Null counts of ALL columns, from footer statistics (no data read):")
+print(nulls[nulls > 0].to_string())
 
 # %% [markdown]
 # **Where is "Flex Fare"?** The 2026 files have no column called Flex Fare. The TLC data dictionary defines
@@ -459,7 +461,7 @@ print(f"Model WAPE {m_model['wape_pct']:.1f}% vs best baseline {m_base['wape_pct
       f"-> MAE {improvement:.0f}% lower than 'same hour last week'")
 
 # A full Monday-Sunday week inside the test month for the figure
-week_start = str(yte.index[yte.index.dayofweek == 0][24].normalize().date())
+week_start = str(yte.index[yte.index.day_of_week == 0][24].normalize().date())
 display(Image(str(plotting.forecast_vs_actual(yte, pred_test, Xte["lag_168"], NICE[BEST["model"]],
                                               "same hour last week", week_start))))
 display(Image(str(plotting.error_vs_baseline(test_metrics))))
@@ -486,7 +488,13 @@ bench = pd.read_csv(config.OUTPUT_DIR / "benchmarks.csv")
 bench_meta = json.loads((config.OUTPUT_DIR / "benchmark_meta.json").read_text())
 bsum = parallel.speedup_table(bench)
 bsum.to_csv(config.OUTPUT_DIR / "benchmark_summary.csv", index=False)
-print({k: bench_meta[k] for k in ["hostname", "cpu_model", "cpus_allocated", "slurm_job_id", "start", "end",
+# CPUs Slurm allocated to the benchmark job (from the job's environment, or its sbatch script).
+# Rockhill's Slurm does not pin cores, so the CPUs a job can *see* (64) are more than it was allocated.
+import re
+bench_cpus = bench_meta.get("slurm_cpus_per_task") or re.search(
+    r"--cpus-per-task=(\d+)", Path("run_benchmark.slurm").read_text()).group(1)
+bench_meta["cpus_slurm_allocated"] = int(bench_cpus)
+print({k: bench_meta[k] for k in ["hostname", "cpu_model", "cpus_slurm_allocated", "slurm_job_id", "start", "end",
                                    "load_average_start", "repeats"]})
 print("Pool start-up cost (s) by workers:", {k: round(v, 3) for k, v in bench_meta["pool_startup_s"].items()})
 display(bsum.round(3))
@@ -498,7 +506,7 @@ amdahl = (bsum[(bsum["mode"] == "parallel") & (bsum["workers"] == k_max)]
           .set_index("workload")[["mean_s", "speedup", "efficiency", "amdahl_p", "max_speedup"]])
 display(amdahl.round(3))
 RESULTS["benchmarks"] = {
-    "meta": {k: bench_meta[k] for k in ["hostname", "cpu_model", "cpus_allocated", "repeats", "worker_counts",
+    "meta": {k: bench_meta[k] for k in ["hostname", "cpu_model", "cpus_slurm_allocated", "repeats", "worker_counts",
                                          "load_average_start", "load_average_end", "pool_startup_s", "start"]},
     "summary": bsum.round(4).to_dict(orient="records"),
     "at_max_workers": amdahl.round(4).to_dict(orient="index"), "max_workers": k_max,
@@ -518,31 +526,37 @@ RESULTS["benchmarks"] = {
 # %% [markdown]
 # # 10. Non-determinism: evidence and fixes
 #
-# Same code, same data, different answer on each run - three sources, each shown **broken twice** (outputs differ)
+# Same code, same data, different answer on each run - three sources, each shown **broken** (outputs differ)
 # and then **fixed twice** (outputs identical).
 #
-# **Sources 1 and 2 - completion order and floating-point reduction order** (real `clean_month` on all 33 months).
-# The broken version collects results with `submit` + `as_completed` and combines them *in the order they finish*:
-# the rows of the hourly series come out in a different order (different hash, different first hour), and the
-# total fare - a sum of 33 floating-point partial sums - changes in its last digits because float addition is not
-# associative. A random 0-2 s sleep in each worker makes the order change visible every run; on a busy shared
-# server finishing order varies anyway.
+# **Sources 1 and 2 - completion order and floating-point reduction order** (the real cleaning rules on all 33
+# months). The broken version collects results with `submit` + `as_completed` and combines them *in the order they
+# finish*: the rows of the hourly series come out in a different order (different hash, different first hour).
+# It also adds up the **sum of squared fares** (needed for the standard deviation of all 115 M fares) from 24,096
+# hourly partial sums in that order, and the last digits change because float addition is not associative.
+# A random 0-2 s sleep in each worker makes the order change visible every run; on a busy shared server finishing
+# order varies anyway.
+#
+# *Why squared fares and three broken runs?* We measured it: with 33 monthly fare subtotals, a different order
+# changed the total in only some runs (fares are whole cents, so many orders round identically). With 24,096 hourly
+# sums of squares the chance that two random orders give the same total is about 1%, so with three broken runs an
+# accidental tie is practically impossible. Either way the lesson holds: the result *can* change between runs.
 
 # %%
 a = nondeterminism.tiny_float_example()
 print("Float addition is not associative:", a)
 ND = []
-for run in (1, 2):
+for run in (1, 2, 3):
     r = nondeterminism.combine_broken(FILES, N_WORKERS)
-    ND.append({"source": "completion+reduction order", "version": "broken", "run": run, **{k: r[k] for k in ["series_hash", "first_hour", "fare_hex"]}, "fare_total": repr(r["fare_total"]), "order_head": ",".join(r["order"][:4])})
+    ND.append({"source": "completion+reduction order", "version": "broken", "run": run, **{k: r[k] for k in ["series_hash", "first_hour", "fare_sq_hex"]}, "fare_sq_total": repr(r["fare_sq_total"]), "order_head": ",".join(r["order"][:4])})
 for run in (1, 2):
     r = nondeterminism.combine_fixed(FILES, N_WORKERS)
-    ND.append({"source": "completion+reduction order", "version": "fixed", "run": run, **{k: r[k] for k in ["series_hash", "first_hour", "fare_hex"]}, "fare_total": repr(r["fare_total"]), "order_head": ",".join(r["order"][:4]), "fare_fsum_hex": r["fare_fsum_hex"]})
+    ND.append({"source": "completion+reduction order", "version": "fixed", "run": run, **{k: r[k] for k in ["series_hash", "first_hour", "fare_sq_hex"]}, "fare_sq_total": repr(r["fare_sq_total"]), "order_head": ",".join(r["order"][:4]), "fare_sq_fsum_hex": r["fare_sq_fsum_hex"]})
 nd1 = pd.DataFrame(ND)
-display(nd1[["version", "run", "order_head", "first_hour", "series_hash", "fare_total", "fare_hex"]])
+display(nd1[["version", "run", "order_head", "first_hour", "series_hash", "fare_sq_total", "fare_sq_hex"]])
 broken1, fixed1 = nd1[nd1.version == "broken"], nd1[nd1.version == "fixed"]
-print("broken runs: same series?", broken1.series_hash.nunique() == 1, "  same fare total?", broken1.fare_hex.nunique() == 1)
-print("fixed runs:  same series?", fixed1.series_hash.nunique() == 1, "  same fare total?", fixed1.fare_hex.nunique() == 1,
+print("broken runs: all same series?", broken1.series_hash.nunique() == 1, "  all same sum of squares?", broken1.fare_sq_hex.nunique() == 1)
+print("fixed runs:  same series?", fixed1.series_hash.nunique() == 1, "  same sum of squares?", fixed1.fare_sq_hex.nunique() == 1,
       "  fixed series equals pipeline output?", fixed1.series_hash.iloc[0] == nondeterminism.series_hash(y))
 
 # %% [markdown]
@@ -566,7 +580,7 @@ for run in (1, 2):
     ND.append({"source": "unseeded randomness", "version": "broken", "run": run, **nondeterminism.random_search_broken(Xtr, ytr)})
 for run in (1, 2):
     ND.append({"source": "unseeded randomness", "version": "fixed", "run": run, **nondeterminism.random_search_fixed(Xtr, ytr)})
-nd3 = pd.DataFrame(ND[4:])[["version", "run", "learning_rate", "max_leaf_nodes", "rmse"]]
+nd3 = pd.DataFrame(ND[5:])[["version", "run", "learning_rate", "max_leaf_nodes", "rmse"]]
 display(nd3)
 b3, f3 = nd3[nd3.version == "broken"], nd3[nd3.version == "fixed"]
 print("broken runs identical?", bool(b3.drop(columns="run").drop(columns="version").duplicated().iloc[-1]))
@@ -587,16 +601,16 @@ RESULTS["nondeterminism"] = {
     "tiny_example": a,
     "completion_order": {"broken_runs_differ": differs(broken1, ["series_hash"]), "fixed_runs_identical": not differs(fixed1, ["series_hash"]),
                          "fixed_equals_pipeline": bool(fixed1.series_hash.iloc[0] == nondeterminism.series_hash(y))},
-    "reduction_order": {"broken_runs_differ": differs(broken1, ["fare_hex"]), "fixed_runs_identical": not differs(fixed1, ["fare_hex"]),
-                        "fixed_fare_total": float.fromhex(fixed1.fare_hex.iloc[0])},
+    "reduction_order": {"broken_runs_differ": differs(broken1, ["fare_sq_hex"]), "fixed_runs_identical": not differs(fixed1, ["fare_sq_hex"]),
+                        "fixed_fare_sq_total": float.fromhex(fixed1.fare_sq_hex.iloc[0])},
     "unseeded_randomness": {"broken_runs_differ": differs(b3, ["learning_rate", "max_leaf_nodes", "rmse"]),
                             "fixed_runs_identical": not differs(f3, ["learning_rate", "max_leaf_nodes", "rmse"])},
     # The broken runs are random by design, so their values change on every notebook run.
     "broken_evidence_this_run": {
         "series_hash": list(broken1.series_hash), "first_hour": list(broken1.first_hour),
-        "fare_total": list(broken1.fare_total), "random_search_best": b3[["learning_rate", "max_leaf_nodes", "rmse"]].round(4).to_dict(orient="records"),
+        "fare_sq_total": list(broken1.fare_sq_total), "random_search_best": b3[["learning_rate", "max_leaf_nodes", "rmse"]].round(4).to_dict(orient="records"),
     },
-    "fixed_evidence": {"series_hash": fixed1.series_hash.iloc[0], "fare_total": fixed1.fare_total.iloc[0],
+    "fixed_evidence": {"series_hash": fixed1.series_hash.iloc[0], "fare_sq_total": fixed1.fare_sq_total.iloc[0],
                        "random_search_best": f3.iloc[0][["learning_rate", "max_leaf_nodes", "rmse"]].to_dict()},
 }
 print(json.dumps({k: v for k, v in RESULTS["nondeterminism"].items() if k != "broken_evidence_this_run"}, indent=1, default=str))

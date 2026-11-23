@@ -27,7 +27,8 @@ WORKLOAD_LABELS = {"cleaning": "Data parallel: clean 33 months",
 
 plt.rcParams.update({
     "figure.dpi": 100, "savefig.dpi": 300, "savefig.bbox": "tight",
-    "font.size": 12, "axes.titlesize": 14, "axes.titleweight": "bold", "axes.labelsize": 12,
+    "font.size": 15, "axes.titlesize": 16, "axes.titleweight": "bold", "axes.labelsize": 15,
+    "legend.fontsize": 13,
     "axes.edgecolor": MUTED, "axes.labelcolor": INK, "xtick.color": MUTED, "ytick.color": MUTED,
     "axes.spines.top": False, "axes.spines.right": False,
     "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.8, "axes.axisbelow": True,
@@ -45,7 +46,7 @@ def _save(fig, name: str) -> Path:
 
 def _shade_weekends(ax, index: pd.DatetimeIndex) -> None:
     days = pd.Series(index.normalize().unique())
-    for d in days[days.dt.dayofweek == 5]:
+    for d in days[days.dt.day_of_week == 5]:
         ax.axvspan(d, d + pd.Timedelta(days=2), color=SHADE, lw=0, zorder=0)
 
 
@@ -81,8 +82,8 @@ def hourly_series(y: pd.Series, zoom_month: str = "2026-04") -> Path:
 def daily_weekly_profile(y: pd.Series) -> Path:
     """Average pickups by hour of day, weekdays vs weekends."""
     df = y.to_frame("p")
-    df["hour"], df["weekend"] = df.index.hour, df.index.dayofweek >= 5
-    prof = df.groupby(["weekend", "hour"])["p"].mean().unstack(0)
+    df["hour_of_day"], df["weekend"] = df.index.hour, df.index.day_of_week >= 5
+    prof = df.groupby(["weekend", "hour_of_day"])["p"].mean().unstack(0)
     fig, ax = plt.subplots(figsize=(8, 4.5))
     ax.plot(prof.index, prof[False], color=BLUE, marker="o", ms=4, label="Weekday")
     ax.plot(prof.index, prof[True], color=ORANGE, marker="o", ms=4, label="Weekend")
@@ -98,32 +99,42 @@ def daily_weekly_profile(y: pd.Series) -> Path:
 
 
 def time_split(index: pd.DatetimeIndex, history_end: pd.Timestamp, fold_ranges: list) -> Path:
-    """Timeline: history (lag warm-up) / CV folds inside train / validation / test."""
-    fig, ax = plt.subplots(figsize=(12, 3))
+    """Timeline of the split, zoomed on 2026 so the folds, validation and test months are visible.
+
+    Training actually starts in Jan 2024 (after a 168-hour lag warm-up); the arrow at the left says so.
+    """
     num = mdates.date2num
-    rows = [("History (168 h lag warm-up)", index[0], history_end, "#b9b8b2", 3)]
-    rows.append(("Train (Jan 2024 - Jul 2026)", history_end, pd.Timestamp(config.TRAIN_END), "#9ec5f4", 3))
+    left = pd.Timestamp("2026-01-01")
+    right = pd.Timestamp(config.TEST_END) + pd.Timedelta(days=3)
+    fig, ax = plt.subplots(figsize=(10, 3.4))
+    bars = [  # (lane, start, end, colour, label inside bar, text colour)
+        (2, left, pd.Timestamp(config.TRAIN_END), "#9ec5f4", f"Train  (from {history_end:%d %b %Y})", INK),
+        (2, pd.Timestamp(config.VAL_START), pd.Timestamp(config.VAL_END), ORANGE, "Val", "white"),
+        (2, pd.Timestamp(config.TEST_START), pd.Timestamp(config.TEST_END), AQUA, "Test", "white"),
+    ]
     for i, (s, e) in enumerate(fold_ranges):
-        rows.append((None, s, e, ORANGE, 2))
-    rows.append(("Validation (Aug 2026)", pd.Timestamp(config.VAL_START), pd.Timestamp(config.VAL_END), "#fde3d6", 3))
-    rows.append(("Test (Sep 2026, scored once)", pd.Timestamp(config.TEST_START), pd.Timestamp(config.TEST_END), AQUA, 3))
-    for lab, s, e, c, lane in rows:
-        ax.broken_barh([(num(s), num(e) - num(s))], (lane - 0.35, 0.7), color=c)
-    ax.text(num(fold_ranges[0][0]), 1.35, "4 CV validation folds (4 weeks each)", color=ORANGE, fontsize=11)
-    ax.set_yticks([2, 3]); ax.set_yticklabels(["CV folds", "Split"])
-    ax.set_ylim(1, 4)
+        bars.append((1, s, e, "#fbc3a8", f"F{i + 1}", INK))
+    for lane, s, e, c, lab, tc in bars:
+        ax.broken_barh([(num(s), num(e) - num(s))], (lane - 0.32, 0.64), color=c, edgecolor="white", lw=2)
+        ax.text(num(s) + (num(e) - num(s)) / 2, lane, lab, ha="center", va="center", color=tc,
+                fontsize=14, fontweight="bold")
+    ax.annotate("", xy=(num(left), 2), xytext=(num(left) + 22, 2),
+                arrowprops={"arrowstyle": "-|>", "color": INK, "lw": 1.5})
+    ax.set_yticks([1, 2]); ax.set_yticklabels(["CV folds\n(inside train)", "Split"])
+    ax.set_ylim(0.4, 2.6)
+    ax.set_xlim(num(left), num(right))
     ax.xaxis_date()
+    ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 3, 5, 7, 9]))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
     ax.grid(False)
-    for lab, s, e, c, lane in rows:
-        if lab:
-            ax.annotate(lab, (num(s) + (num(e) - num(s)) / 2, 3.45), ha="center", fontsize=9, color=INK)
-    ax.set_title("Time-based split - training always precedes validation and test")
+    ax.spines["left"].set_visible(False)
+    ax.set_title("Each fold validates on the 4 weeks after its training block")
     return _save(fig, "time_split.png")
 
 
 def speedup(summary: pd.DataFrame) -> Path:
     """Speedup vs workers per workload, with the ideal y = x line."""
-    fig, ax = plt.subplots(figsize=(7, 5.5))
+    fig, ax = plt.subplots(figsize=(8.5, 5))
     par = summary[summary["mode"] == "parallel"]
     kmax = int(par["workers"].max())
     ax.plot([1, kmax], [1, kmax], ls="--", color=MUTED, lw=1.2, label="Ideal (speedup = workers)")
@@ -133,7 +144,7 @@ def speedup(summary: pd.DataFrame) -> Path:
                 label=WORKLOAD_LABELS[wl])
         last = sub.iloc[-1]
         ax.annotate(f"{last['speedup']:.1f}x", (last["workers"], last["speedup"]),
-                    xytext=(8, 0), textcoords="offset points", va="center", color=INK, fontsize=11)
+                    xytext=(8, 0), textcoords="offset points", va="center", color=INK, fontsize=15, fontweight="bold")
     ax.axhline(1, color=GRID, lw=1)
     ax.set_xticks(sorted(par["workers"].unique()))
     ax.set_xlabel("Worker processes")
@@ -141,7 +152,7 @@ def speedup(summary: pd.DataFrame) -> Path:
     ax.set_xlim(0.5, kmax + 1.5)
     ax.set_ylim(0, kmax + 0.5)
     ax.set_title("Speedup vs workers (mean of 3 timed runs)")
-    ax.legend(loc="upper left", fontsize=10)
+    ax.legend(loc="upper left")
     return _save(fig, "speedup.png")
 
 
@@ -163,16 +174,16 @@ def forecast_vs_actual(y_true: pd.Series, y_model: pd.Series, y_base: pd.Series,
                        model_name: str, base_name: str, start: str, days: int = 7) -> Path:
     """One test week: actual vs model vs best baseline."""
     sl = slice(pd.Timestamp(start), pd.Timestamp(start) + pd.Timedelta(days=days) - pd.Timedelta(hours=1))
-    fig, ax = plt.subplots(figsize=(12, 4.5))
+    fig, ax = plt.subplots(figsize=(12, 4))
     _shade_weekends(ax, y_true.loc[sl].index)
     ax.plot(y_true.loc[sl], color=INK, lw=2.2, label="Actual pickups")
     ax.plot(y_model.loc[sl], color=BLUE, lw=1.8, label=f"Forecast: {model_name}")
     ax.plot(y_base.loc[sl], color=ORANGE, lw=1.4, ls="--", label=f"Baseline: {base_name}")
     ax.set_ylabel("Pickups per hour")
     ax.set_ylim(0, None)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%a %d %b"))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%a %d"))
     ax.set_title("One-hour-ahead forecast on a held-out test week")
-    ax.legend(loc="upper left", ncol=3, fontsize=10)
+    ax.legend(loc="upper left", ncol=3, fontsize=13)
     return _save(fig, "forecast_vs_actual.png")
 
 
@@ -180,14 +191,16 @@ def error_vs_baseline(metrics_df: pd.DataFrame) -> Path:
     """Test error (WAPE %) per method, lower is better. Row 0 of metrics_df = the chosen model."""
     chosen = metrics_df["method"].iloc[0]
     m = metrics_df.sort_values("wape_pct", ascending=True)
-    fig, ax = plt.subplots(figsize=(8, 3.8))
+    fig, ax = plt.subplots(figsize=(9, 3.6))
     colours = [BLUE if r == chosen else ("#9ec5f4" if r.startswith("Model") else "#b9b8b2") for r in m["method"]]
-    bars = ax.barh(m["method"], m["wape_pct"], color=colours, height=0.6)
+    labels = [r.replace("Model: ", "").replace("Baseline: ", "No model: ").replace(" (", "\n(") for r in m["method"]]
+    bars = ax.barh(labels, m["wape_pct"], color=colours, height=0.7)
     for b, v in zip(bars, m["wape_pct"]):
-        ax.text(b.get_width() + 0.3, b.get_y() + b.get_height() / 2, f"{v:.1f}%", va="center", color=INK)
+        ax.text(b.get_width() + 0.3, b.get_y() + b.get_height() / 2, f"{v:.1f}%", va="center", color=INK,
+                fontsize=15, fontweight="bold")
     ax.invert_yaxis()
-    ax.set_xlabel("Test error: total |error| as % of actual pickups (lower is better)")
-    ax.set_xlim(0, m["wape_pct"].max() * 1.18)
+    ax.tick_params(axis="y", labelsize=13)
+    ax.set_xlabel("Error as % of actual pickups (WAPE) - lower is better")
+    ax.set_xlim(0, m["wape_pct"].max() * 1.2)
     ax.grid(axis="y", visible=False)
-    ax.set_title("Test month (Sep 2026): model vs no-model baselines")
     return _save(fig, "error_vs_baseline.png")

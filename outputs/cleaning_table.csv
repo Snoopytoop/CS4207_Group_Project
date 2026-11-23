@@ -1,0 +1,8 @@
+rule,rows,pct_of_raw
+raw rows,123471721,100.0
+pickup_outside_month,802,0.001
+duration_out_of_range,2413007,1.954
+distance_out_of_range,2306367,1.868
+fare_not_positive,3393484,2.748
+duplicate_rows,2,0.0
+kept rows,115358059,93.429

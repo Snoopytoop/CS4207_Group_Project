@@ -1,0 +1,6 @@
+window,day_type,mean_pickups_per_hour
+morning_peak 07:00-09:59,weekday,4934.2
+morning_peak 07:00-09:59,weekend,2432.2
+evening_peak 16:00-19:59,weekday,7390.0
+evening_peak 16:00-19:59,weekend,6987.8
+all hours,all,4787.4

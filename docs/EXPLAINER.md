@@ -171,7 +171,28 @@ counts all zones together, so the zone category is not a model input – it woul
   system would know.
 - **Metrics:** MAE (average miss in pickups/hour), RMSE (penalises big misses more), **WAPE** (total absolute
   error ÷ total pickups – the "% of actual volume" in the course example), MAPE.
-- *Results paragraph – filled in after the final run (see below).*
+- **Which model won:** on the CV folds every top-7 setting was gradient boosting predicting the level
+  directly. On the August validation month the best HGB (learning rate 0.1, 15 leaves, 500 iterations)
+  had RMSE 378 vs 485 for the best Ridge and 760 for "same hour last week" → HGB chosen.
+- **Test month (Sep 2026, scored once):**
+
+  | Method | MAE (pickups/h) | RMSE | WAPE |
+  |---|---|---|---|
+  | **Gradient boosting** | **277** | **388** | **5.4%** |
+  | Ridge (predicts change vs last week) | 415 | 562 | 8.2% |
+  | Baseline: same hour last week | 698 | 987 | 13.7% |
+  | Baseline: same hour yesterday | 908 | 1,392 | 17.9% |
+
+- **We beat the baseline – but be ready to explain why, given the course example lost to it.** Our forecast is
+  *one hour ahead*: the model knows the pickups of the last 1–3 hours (`lag_1`…`lag_3`). "Same hour last week"
+  ignores what is happening *right now* (weather, events, a holiday, a slow day). The course example only had
+  one month of data (384 training hours); we have ~22,000 training hours, so the boosting model can learn the
+  hour × weekday shape and how today's level differs from last week's. MAE is **60% lower** than the best
+  baseline.
+- **Why Ridge is worse than HGB:** Ridge is linear – it cannot represent "8 am is busy on weekdays but quiet
+  on Sundays" without hand-made interaction features. Trees learn such interactions automatically.
+- **Why the 'diff168' target did not help HGB:** with lag_1 available, the previous hour is a better anchor
+  than last week; for Ridge the diff target was slightly better.
 
 ## Section 9: benchmarks and Amdahl
 
@@ -185,14 +206,36 @@ counts all zones together, so the zone category is not a model input – it woul
 - **Overheads:** process start-up (measured: empty pool), pickling results/data between processes, all workers
   reading Parquet from the same disk, load imbalance, and – important on Rockhill – **other users**: the load
   average was ~124 on 64 hardware threads during our runs, from long-running jobs that do not go through Slurm.
-- *Numbers – filled in after the final run.*
+- **Results** (benchmark job on 8 Slurm CPUs; mean of 3 timed runs after a warm-up; std below 2%):
+
+  | Workload | Sequential | 1-worker pool | 2 | 4 | 8 workers | Speedup (8) | Efficiency (8) | Amdahl p |
+  |---|---|---|---|---|---|---|---|---|
+  | Data parallel: clean 33 months | 125.8 s | 132.5 s | 69.3 s | 37.5 s | 21.8 s | **5.76×** | 0.72 | 0.945 |
+  | Task parallel: 96 search fits | 90.4 s | 91.6 s | 46.1 s | 23.9 s | 13.1 s | **6.92×** | 0.87 | 0.978 |
+  | Task parallel: 3 feature blocks | 18 ms | 110 ms | 133 ms | 189 ms | 303 ms | 0.06× | 0.01 | < 0 |
+
+- **How to read it:**
+  - The **1-worker pool** is slower than the plain loop (132.5 vs 125.8 s): that 5% is pure overhead (starting a
+    process, pickling each month's result back).
+  - **Search scales best** (p ≈ 0.98, efficiency 0.87): 96 tasks, each 0.01–2.4 s of pure computation, and the
+    data is sent once per worker. What is lost is mostly the **tail** – at the end a few long HGB fits run while
+    other workers idle – plus pool start-up.
+  - **Cleaning scales less** (p ≈ 0.945, efficiency 0.72): every worker reads Parquet from the **same disk** and
+    needs ~2 GB of memory bandwidth, and 33 shards on 8 workers leave a final round with only one busy worker.
+    Amdahl says even infinite workers would cap at ~18×.
+  - **Features get slower** with more workers: 18 ms of work vs ~100 ms just to start processes and copy the
+    series. p comes out negative – the formula's way of saying the overhead is bigger than the work.
+    Lesson: only parallelise work that is large compared with the overhead.
+  - **Shared server:** load average ~124 on 64 threads during the benchmark – other users' processes
+    compete with ours, so our speedups are probably slightly pessimistic, and they could vary on another day.
+  - Pool start-up measured directly: 0.04 s (1 worker) to 0.10 s (8 workers).
 
 ## Section 10: non-determinism
 
 | Source | Broken version | Fix | Limits of the fix |
 |---|---|---|---|
 | **Completion order** | `submit` + `as_completed`, concatenating months as they finish → rows in a different order each run (different hash / first hour) | sort by month before combining (or use `map`, which returns input order) | must wait for all shards before combining; costs a sort |
-| **Float reduction order** | total fare = sum of 33 float partial sums in completion order → last digits change | add in a fixed (month) order; or `math.fsum`, which is exactly rounded so order doesn't matter | fixed order = repeatable, not more accurate; `fsum` is slower and only for sums |
+| **Float reduction order** | sum of squared fares (needed for the fare standard deviation) = 24,096 hourly partial sums added in completion order → last digits change | add in a fixed (month) order; or `math.fsum`, which is exactly rounded so order doesn't matter | fixed order = repeatable, not more accurate; `fsum` is slower and only for sums |
 | **Unseeded randomness** | random search with an unseeded generator + HGB early stopping with a random validation split → different "best" setting each run | base seed 42 for the generator, per-trial seed 42 + trial id for each model | reproducible only for the same task list, library versions and data; one seed hides how much results vary |
 | (prevented) **thread count** | multi-threaded BLAS can split sums differently | 1 thread per process | parallelism must then come from processes |
 
@@ -208,6 +251,28 @@ the order changes anyway, just not reliably enough for a demo. We say this openl
   deliberately broken demos.
 
 ---
+
+## Code walkthrough – the six functions to know
+
+1. **`cleaning.apply_rules(df, month)`** – applies the 5 rules in order. A small inner function `drop(mask, rule)`
+   records `mask.sum()` (how many rows the rule removes) and keeps `df.loc[~mask]`. Because each rule runs on
+   what the previous rule left, every row is counted once, under the first rule it breaks.
+2. **`cleaning.clean_month(path)`** – the data-parallel worker: read 10 columns → `apply_rules` → categories →
+   `hourly_counts` (floor to the hour, `value_counts`, re-index to every hour of the month, fill 0) → returns
+   `(series, stats)`. It only depends on its file, so any process gives the same answer.
+3. **`parallel.run_parallel(func, items, workers)`** – `ProcessPoolExecutor(max_workers=workers,
+   initializer=pin_single_thread)` and `list(ex.map(func, items, chunksize=1))`. `map` returns results in the
+   order of `items`; `chunksize=1` hands out one item at a time (better balance for uneven tasks).
+4. **`cleaning.combine_months(results)`** – the reduce step: sort by month, `pd.concat` the series, stack the
+   stats into a table.
+5. **`features.rolling_features(y)`** – `past = y.shift(1)` first, then `past.rolling(w).mean()/std()/max()` –
+   the window for hour t covers t−w … t−1, never t itself.
+6. **`models.fit_and_score(task)`** – one search task: look up the fold's training/validation row numbers, fit
+   the model (Ridge pipeline or HGB, level or diff target), predict the validation block, return
+   `task_id, rmse, mae, seconds`. `run_search` runs all 96 with `map` and sorts by `task_id`.
+
+Bonus: **`nondeterminism.combine_broken` vs `combine_fixed`** – identical except for one line:
+`results.sort(key=lambda r: r[1]["month"])` before combining.
 
 ## Glossary (things a marker may ask)
 
@@ -225,3 +290,11 @@ the order changes anyway, just not reliably enough for a demo. We say this openl
 - **Non-determinism:** same code and data giving different output on different runs.
 - **Pickling:** how Python serialises objects to send them between processes.
 - **GIL:** Python's global interpreter lock – only one thread runs Python bytecode at a time in a process.
+
+**Why the sum of *squared* fares, and three broken runs?** We first used the total fare from 33 monthly
+subtotals. In one run the two "broken" totals happened to be identical, so we **measured** it with 3,000 random
+month orders: 33 monthly subtotals gave only 5 distinct totals (fares are whole cents, so most orders round the
+same way); 24,096 hourly sums of squared fares give a ~1% chance that two orders agree. The notebook therefore
+uses the sum of squares (a real quantity: it is what you need for the standard deviation of all fares) and three
+broken runs. Lesson for the Q&A: non-determinism does not have to show up in every run to be a bug – a program
+that is only *usually* repeatable is not reproducible.

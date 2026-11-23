@@ -166,7 +166,7 @@ def cleaning_table(stats: pd.DataFrame) -> pd.DataFrame:
 def peak_profile(series: pd.Series) -> pd.DataFrame:
     """Descriptive peak-period demand: mean pickups/hour in each window, weekday vs weekend."""
     df = series.to_frame("pickups")
-    df["weekend"] = np.where(df.index.dayofweek >= 5, "weekend", "weekday")
+    df["weekend"] = np.where(df.index.day_of_week >= 5, "weekend", "weekday")
     rows = []
     for name, (h0, h1) in config.PEAK_WINDOWS.items():
         in_win = (df.index.hour >= h0) & (df.index.hour <= h1)

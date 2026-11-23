@@ -30,7 +30,7 @@ def diff(a, b, path=""):
     elif isinstance(a, list) and len(a) == len(b):
         for i, (x, y) in enumerate(zip(a, b)):
             yield from diff(x, y, f"{path}[{i}]")
-    elif a != b:
+    elif a != b and not (isinstance(a, float) and a != a and b != b):   # NaN == NaN here
         yield f"{path}: {a!r} != {b!r}"
 
 

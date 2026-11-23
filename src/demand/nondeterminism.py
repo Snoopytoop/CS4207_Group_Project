@@ -15,7 +15,8 @@ import numpy as np
 import pandas as pd
 
 from . import config
-from .cleaning import clean_month
+from .cleaning import apply_rules, hourly_counts
+from .io import read_month
 from .models import cv_folds, fit_predict, metrics
 from .parallel import pin_single_thread
 
@@ -26,34 +27,44 @@ def series_hash(s: pd.Series) -> str:
     return h.hexdigest()[:12]
 
 
-def clean_month_jittered(path) -> tuple[pd.Series, dict]:
-    """The real clean_month plus a random 0-2 s sleep.
+def clean_month_jittered(path) -> tuple[str, pd.Series, list[float]]:
+    """The real cleaning of one month (same rules and hourly counts as clean_month), plus:
 
-    The sleep only exaggerates what happens on a busy shared server anyway (workers finish
-    at slightly different times); it makes the completion-order effect visible every run.
+    - the month's HOURLY sums of squared fares (~730 floats per shard, 24,096 in total) - the
+      partial sums needed for the standard deviation of all fares. In the reduction demo, ~24,000
+      additions make a different order change the rounding in ~99% of runs (33 monthly fare
+      subtotals did so only sometimes - we measured it);
+    - a random 0-2 s sleep. It only exaggerates what happens on a busy shared server anyway
+      (workers finish at slightly different times) so the effect is visible in every run.
     """
     time.sleep(random.Random().uniform(0, 2))   # unseeded on purpose: models server noise
-    return clean_month(path)
+    month = config.month_of(path)
+    df, _ = apply_rules(read_month(path), month)
+    series, _ = hourly_counts(df["tpep_pickup_datetime"], month)
+    fare = df["fare_amount"]
+    fare_sq = (fare * fare).groupby(df["tpep_pickup_datetime"].dt.floor("h")).sum()
+    return month, series, fare_sq.to_list()
 
 
 # ---------------------------------------------------------------- source 1 + 2: completion order
 def combine_broken(files, workers: int) -> dict:
     """BROKEN: take results as they complete (as_completed) and combine in that order.
 
-    - series rows are concatenated in completion order       -> source 1 (completion order)
-    - fare partial sums are added in completion order (float) -> source 2 (reduction order)
+    - series rows are concatenated in completion order          -> source 1 (completion order)
+    - hourly sums of squared fares are added in completion order -> source 2 (reduction order)
     """
-    parts, fare_total, order = [], 0.0, []
+    parts, fare_sq_total, order = [], 0.0, []
     with ProcessPoolExecutor(max_workers=workers, initializer=pin_single_thread) as ex:
         futures = [ex.submit(clean_month_jittered, f) for f in files]
         for fut in as_completed(futures):
-            s, st = fut.result()
+            month, s, fare_sq = fut.result()
             parts.append(s)
-            fare_total += st["fare_sum"]
-            order.append(st["month"])
+            for v in fare_sq:
+                fare_sq_total += v
+            order.append(month)
     y = pd.concat(parts)
     return {"series_hash": series_hash(y), "first_hour": str(y.index[0]),
-            "fare_total": fare_total, "fare_hex": fare_total.hex(), "order": order}
+            "fare_sq_total": fare_sq_total, "fare_sq_hex": fare_sq_total.hex(), "order": order}
 
 
 def combine_fixed(files, workers: int) -> dict:
@@ -65,15 +76,16 @@ def combine_fixed(files, workers: int) -> dict:
         futures = [ex.submit(clean_month_jittered, f) for f in files]
         for fut in as_completed(futures):          # still arrives in random order ...
             results.append(fut.result())
-    results.sort(key=lambda r: r[1]["month"])     # ... but the order is fixed before combining
-    y = pd.concat([s for s, _ in results])
-    fare_total = 0.0
-    for _, st in results:
-        fare_total += st["fare_sum"]
-    fare_fsum = math.fsum(st["fare_sum"] for _, st in results)
+    results.sort(key=lambda r: r[0])              # ... but the order is fixed before combining
+    y = pd.concat([s for _, s, _ in results])
+    fare_sq_total = 0.0
+    for _, _, fare_sq in results:
+        for v in fare_sq:
+            fare_sq_total += v
+    fare_sq_fsum = math.fsum(v for _, _, fare_sq in results for v in fare_sq)
     return {"series_hash": series_hash(y), "first_hour": str(y.index[0]),
-            "fare_total": fare_total, "fare_hex": fare_total.hex(),
-            "fare_fsum_hex": fare_fsum.hex(), "order": [st["month"] for _, st in results]}
+            "fare_sq_total": fare_sq_total, "fare_sq_hex": fare_sq_total.hex(),
+            "fare_sq_fsum_hex": fare_sq_fsum.hex(), "order": [m for m, _, _ in results]}
 
 
 def tiny_float_example() -> dict:

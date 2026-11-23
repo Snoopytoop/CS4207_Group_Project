@@ -47,7 +47,7 @@ def calendar_features(index: pd.DatetimeIndex) -> pd.DataFrame:
 
     These are known in advance for any future hour, so they cannot leak.
     """
-    hour, dow = index.hour.to_numpy(), index.dayofweek.to_numpy()
+    hour, dow = index.hour.to_numpy(), index.day_of_week.to_numpy()
     hol = us_holidays(sorted(set(index.year)))
     return pd.DataFrame({
         "hour_sin": np.sin(2 * np.pi * hour / 24), "hour_cos": np.cos(2 * np.pi * hour / 24),
