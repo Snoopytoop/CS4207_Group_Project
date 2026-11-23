@@ -1,0 +1,16 @@
+# Copy to project/.gitignore
+*.parquet
+*.csv.gz
+venv/
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+logs/
+.env
+*.key
+id_ed25519*
+.DS_Store
+Thumbs.db
+outputs/_*
+*.ipynb_checkpoints
